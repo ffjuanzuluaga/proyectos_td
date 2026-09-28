@@ -412,6 +412,199 @@ def clasificar_movimiento(projects: pd.DataFrame, inicio: date, fin: date) -> di
     }
 
 
+MESES_CORTO = ("Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic")
+
+
+def periodos_recientes(fin: date, cantidad: int = 6) -> list[dict]:
+    """Los últimos N meses, cortados el día del reporte si el mes no ha cerrado."""
+    periodos = []
+    anio, mes = fin.year, fin.month
+    for _ in range(cantidad):
+        inicio = date(anio, mes, 1)
+        if mes == 12:
+            ultimo = date(anio, 12, 31)
+        else:
+            ultimo = date(anio, mes + 1, 1) - timedelta(days=1)
+        corte = fin if (anio, mes) == (fin.year, fin.month) else ultimo
+        periodos.append({
+            "anio": anio,
+            "mes": mes,
+            "inicio": inicio,
+            "fin": corte,
+            "etiqueta": f"{MESES_CORTO[mes - 1]} {anio}",
+        })
+        mes -= 1
+        if mes == 0:
+            mes = 12
+            anio -= 1
+    return list(reversed(periodos))
+
+
+def serie_ingreso_entrega(projects: pd.DataFrame, horas: pd.DataFrame, fin: date, cantidad: int = 6) -> pd.DataFrame:
+    """Horas vendidas que entran al mes (proyectos que inician) frente a horas registradas."""
+    filas = []
+    for periodo in periodos_recientes(fin, cantidad):
+        if projects is None or projects.empty:
+            ingresan = 0.0
+        else:
+            entran = _en_rango(projects["fecha_inicio"], periodo["inicio"], periodo["fin"])
+            ingresan = float(projects.loc[entran, "horas_vendidas"].sum())
+        if horas is None or horas.empty:
+            entregadas = 0.0
+        else:
+            del_mes = horas[(horas["anio"] == periodo["anio"]) & (horas["mes"] == periodo["mes"])]
+            entregadas = float(del_mes["horas"].sum())
+        filas.append({
+            "Mes": periodo["etiqueta"],
+            "anio": periodo["anio"],
+            "mes": periodo["mes"],
+            "inicio": periodo["inicio"],
+            "fin": periodo["fin"],
+            "Horas que ingresan": _round2(ingresan),
+            "Horas entregadas": _round2(entregadas),
+        })
+    return pd.DataFrame(filas)
+
+
+def serie_apertura_cierre(projects: pd.DataFrame, fin: date, cantidad: int = 6) -> pd.DataFrame:
+    filas = []
+    for periodo in periodos_recientes(fin, cantidad):
+        if projects is None or projects.empty:
+            abiertos = cerrados = 0
+        else:
+            abiertos = int(_en_rango(projects["fecha_inicio"], periodo["inicio"], periodo["fin"]).sum())
+            cerrados = int(_en_rango(projects["fecha_real_cierre"], periodo["inicio"], periodo["fin"]).sum())
+        filas.append({
+            "Mes": periodo["etiqueta"],
+            "Proyectos abiertos": abiertos,
+            "Proyectos cerrados": cerrados,
+        })
+    return pd.DataFrame(filas)
+
+
+def _dias(a, b) -> float | None:
+    inicio = pd.to_datetime(a, errors="coerce")
+    fin = pd.to_datetime(b, errors="coerce")
+    if pd.isna(inicio) or pd.isna(fin):
+        return None
+    return float((fin.normalize() - inicio.normalize()).days)
+
+
+def salud_proyectos(projects: pd.DataFrame, horas: pd.DataFrame, fecha: date) -> pd.DataFrame:
+    """Planeado contra entregado, en horas y en fechas."""
+    columnas = [
+        "Proyecto", "Estado", "Tipo", "Inicio", "Fin planeado", "Cierre real",
+        "H. vendidas", "H. ejecutadas", "H. pendientes", "% avance",
+        "Pendientes reales", "Desfase horas %", "Desfase tiempo %",
+    ]
+    if projects is None or projects.empty:
+        return pd.DataFrame(columns=columnas)
+    registradas = {}
+    if horas is not None and not horas.empty:
+        registradas = horas.groupby("project_id")["horas"].sum().to_dict()
+    filas = []
+    for rec in projects.to_dict("records"):
+        vendidas = _num(rec.get("horas_vendidas"))
+        ejecutadas = _num(rec.get("horas_ejecutadas"))
+        pendientes = _num(rec.get("horas_pendientes"))
+        entregadas = _num(registradas.get(rec.get("project_id"), 0))
+        avance = ejecutadas / vendidas if vendidas else None
+        reales = vendidas - entregadas
+        desfase_horas = (entregadas - vendidas) / vendidas if vendidas else None
+        duracion = _dias(rec.get("fecha_inicio"), rec.get("fecha_fin"))
+        cierre = rec.get("fecha_real_cierre")
+        if pd.notna(pd.to_datetime(cierre, errors="coerce")) and duracion:
+            atraso = _dias(rec.get("fecha_fin"), cierre)
+        elif duracion and pd.to_datetime(rec.get("fecha_fin"), errors="coerce") < pd.Timestamp(fecha):
+            atraso = _dias(rec.get("fecha_fin"), fecha)
+        else:
+            atraso = 0 if duracion else None
+        desfase_tiempo = (atraso / duracion) if duracion else None
+        filas.append({
+            "Proyecto": rec.get("proyecto_ui") or rec.get("proyecto"),
+            "Estado": rec.get("etapa_proyecto"),
+            "Tipo": rec.get("etiquetas") or "",
+            "Inicio": rec.get("fecha_inicio"),
+            "Fin planeado": rec.get("fecha_fin"),
+            "Cierre real": cierre,
+            "H. vendidas": _round2(vendidas),
+            "H. ejecutadas": _round2(ejecutadas),
+            "H. pendientes": _round2(pendientes),
+            "% avance": avance,
+            "Pendientes reales": _round2(reales),
+            "Desfase horas %": desfase_horas,
+            "Desfase tiempo %": desfase_tiempo,
+        })
+    return pd.DataFrame(filas, columns=columnas)
+
+
+def _clave_persona(nombre: str) -> str:
+    plano = unicodedata.normalize("NFD", str(nombre or ""))
+    plano = "".join(c for c in plano if unicodedata.category(c) != "Mn")
+    return " ".join(sorted(parte for parte in plano.casefold().replace(",", " ").split() if parte))
+
+
+def productividad_backlog(acciones: pd.DataFrame, capacidad: dict[str, float]) -> pd.DataFrame:
+    """Horas de backlog y planeación asignadas hoy, frente a la capacidad del mes.
+
+    No usa el parte de horas. La salida es lo que ya está en tareas finalizadas.
+    """
+    columnas = [
+        "Recurso", "Backlog asignado", "Planeadas", "Salida ejecutada",
+        "Capacidad del mes", "Desfase vs capacidad",
+    ]
+    if acciones is None or acciones.empty:
+        return pd.DataFrame(columns=columnas)
+    cuadro = (
+        acciones.pivot_table(index="usuario", columns="accion", values="cantidad", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    indice = {_clave_persona(nombre): valor for nombre, valor in (capacidad or {}).items()}
+    filas = []
+    for rec in cuadro.to_dict("records"):
+        nombre = str(rec.get("usuario") or "-")
+        backlog = _num(rec.get("H. Pendientes"))
+        planeadas = _num(rec.get("H. Planeadas"))
+        salida = _num(rec.get("H. Ejecutadas"))
+        cupo = (capacidad or {}).get(nombre)
+        if cupo is None:
+            cupo = indice.get(_clave_persona(nombre))
+        asignadas = backlog + planeadas
+        filas.append({
+            "Recurso": nombre,
+            "Backlog asignado": _round2(backlog),
+            "Planeadas": _round2(planeadas),
+            "Salida ejecutada": _round2(salida),
+            "Capacidad del mes": None if cupo is None else _round2(cupo),
+            "Desfase vs capacidad": None if cupo is None else _round2(asignadas - cupo),
+        })
+    out = pd.DataFrame(filas, columns=columnas)
+    return out.sort_values("Backlog asignado", ascending=False, kind="stable").reset_index(drop=True)
+
+
+def capacidad_periodo(empleados, asistencia, ausencias, inicio: date, fin: date, tz_name: str, factor: float) -> tuple[dict[str, float], float]:
+    """Capacidad de entrega (horario menos festivos y ausencias, por el factor) de cada persona."""
+    por_nombre: dict[str, float] = {}
+    total = 0.0
+    if empleados is None or empleados.empty:
+        return por_nombre, 0.0
+    for rec in empleados.to_dict("records"):
+        cal = rec.get("calendar_id")
+        cap = capacidad_empleado(
+            int(cal) if cal else None,
+            int(rec["resource_id"]) if rec.get("resource_id") else None,
+            asistencia or [],
+            ausencias or [],
+            inicio,
+            fin,
+            tz_name,
+            _factor_persona(rec.get("factor"), factor),
+        )
+        por_nombre[str(rec.get("nombre") or "-")] = cap["deberia"]
+        total += cap["deberia"]
+    return por_nombre, _round2(total)
+
+
 def _horas_del_dia(dia: date, calendar_id: int | None, asistencia: list[dict]) -> float:
     """Horas del día. Si dos franjas se solapan, se cuentan una sola vez."""
     if not calendar_id:
@@ -1376,3 +1569,59 @@ def load_horas_equipo(employee_ids: tuple[int, ...], date_from: str, date_to: st
             "horas": _num(linea.get("unit_amount")),
         })
     return build_horas_empleado(rows)
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando tickets de soporte...")
+def load_tickets_resumen(date_from: str, date_to: str) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+    """Tickets creados o cerrados en el rango, y demora media por criticidad."""
+    vacio = pd.DataFrame()
+    try:
+        campos = _pick("helpdesk.ticket", ["create_date", "close_date", "priority", "close_hours"])
+    except OdooError as exc:
+        return vacio, vacio, str(exc)
+    if "create_date" not in campos:
+        return vacio, vacio, "Este usuario no puede leer helpdesk.ticket."
+    dominio = [
+        "|",
+        "&", ("create_date", ">=", f"{date_from} 00:00:00"), ("create_date", "<=", f"{date_to} 23:59:59"),
+        "&", ("close_date", ">=", f"{date_from} 00:00:00"), ("close_date", "<=", f"{date_to} 23:59:59"),
+    ]
+    try:
+        registros = search_read("helpdesk.ticket", dominio, campos, order="id")
+        etiquetas = {"0": "Baja", "1": "Media", "2": "Alta", "3": "Urgente"}
+        info = odoo_call("helpdesk.ticket", "fields_get", [["priority"]], {"attributes": ["selection"]})
+        seleccion = info.get("priority", {}).get("selection") or []
+        if seleccion:
+            etiquetas = {str(clave): texto for clave, texto in seleccion}
+    except OdooError as exc:
+        return vacio, vacio, str(exc)
+    if not registros:
+        return vacio, vacio, None
+    frame = pd.DataFrame(registros)
+    frame["create_date"] = pd.to_datetime(frame.get("create_date"), errors="coerce")
+    frame["close_date"] = pd.to_datetime(frame.get("close_date"), errors="coerce")
+    desde = pd.Timestamp(date_from)
+    hasta = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+    abiertos = frame[frame["create_date"].between(desde, hasta, inclusive="left")].copy()
+    cerrados = frame[frame["close_date"].between(desde, hasta, inclusive="left")].copy()
+    if not abiertos.empty:
+        abiertos["periodo"] = abiertos["create_date"].dt.to_period("M").astype(str)
+    if not cerrados.empty:
+        cerrados["periodo"] = cerrados["close_date"].dt.to_period("M").astype(str)
+    meses = sorted(set(abiertos["periodo"] if not abiertos.empty else []) | set(cerrados["periodo"] if not cerrados.empty else []))
+    mensual = pd.DataFrame({
+        "Mes": meses,
+        "Abiertos": [int((abiertos["periodo"] == mes).sum()) if not abiertos.empty else 0 for mes in meses],
+        "Cerrados": [int((cerrados["periodo"] == mes).sum()) if not cerrados.empty else 0 for mes in meses],
+    })
+    if cerrados.empty or "close_hours" not in cerrados.columns:
+        criticidad = pd.DataFrame(columns=["Criticidad", "Tickets cerrados", "Horas promedio"])
+    else:
+        cerrados["Criticidad"] = cerrados["priority"].map(lambda v: etiquetas.get(str(v), str(v or "Sin prioridad")))
+        criticidad = (
+            cerrados.groupby("Criticidad", as_index=False)
+            .agg(**{"Tickets cerrados": ("priority", "size"), "Horas promedio": ("close_hours", "mean")})
+        )
+        criticidad["Horas promedio"] = criticidad["Horas promedio"].map(lambda v: _round2(v) if pd.notna(v) else None)
+    return mensual, criticidad, None
+

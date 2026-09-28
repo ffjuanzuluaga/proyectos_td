@@ -32,7 +32,7 @@ Un cuadro, una fila por proyecto:
 | BackLog | Tareas raíz en Inicio |
 | Planning | Tareas raíz en Planeado o En ejecución, sin Hecho ni Cancelado |
 | Done | Tareas raíz en Finalizado |
-| Desface | Contratadas − Acumulado − Mes |
+| Desfase | Contratadas − Acumulado − Mes |
 
 La fecha del reporte arranca en el día en que se abre el tablero. Al seleccionar una fila se despliega vendedor, gerente, fechas, recursos y el detalle de horas registradas.
 

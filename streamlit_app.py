@@ -2,7 +2,7 @@
 """Cuadro de ocupación de Transformación Digital, leído de Odoo por XML-RPC.
 
 La tabla sigue la hoja de seguimiento: Contratadas, Acumulado, Mes, BackLog,
-Planning, Done y Desface. Al marcar un proyecto se despliega el detalle.
+Planning, Done y Desfase. Al marcar un proyecto se despliega el detalle.
 
 Secrets en `.streamlit/secrets.toml` (local) o en Settings → Secrets (Cloud).
 """
@@ -14,6 +14,7 @@ import streamlit as st
 
 from odoo_io import (
     OdooError,
+    capacidad_periodo,
     clasificar_movimiento,
     cuadro_entrega,
     cuadro_reporte,
@@ -24,6 +25,12 @@ from odoo_io import (
     load_plantilla,
     load_registered,
     load_snapshot,
+    load_tickets_resumen,
+    periodos_recientes,
+    productividad_backlog,
+    salud_proyectos,
+    serie_apertura_cierre,
+    serie_ingreso_entrega,
 )
 
 st.set_page_config(
@@ -33,11 +40,12 @@ st.set_page_config(
 )
 
 COLUMNAS_EXCEL = [
-    "Proyecto", "Etapa Proyecto", "Fecha de Inicio", "Fecha de Fin", "Etiquetas",
-    "Vendedor", "Gerente", "Pry Cierre", "Rapidez", "Asignadas", "Contratadas",
-    "Acumulado", "Mes", "BackLog", "Planning", "Done", "Desface",
+    "Proyecto", "Etapa Proyecto", "Contratadas", "Acumulado", "Mes",
+    "BackLog", "Planning", "Done", "Desfase", "Asignadas",
+    "Fecha de Inicio", "Fecha de Fin", "Etiquetas", "Vendedor", "Gerente",
+    "Pry Cierre", "Rapidez",
 ]
-HORAS = ["Asignadas", "Contratadas", "Acumulado", "Mes", "BackLog", "Planning", "Done", "Desface"]
+HORAS = ["Contratadas", "Acumulado", "Mes", "BackLog", "Planning", "Done", "Desfase", "Asignadas"]
 
 
 def csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -183,7 +191,7 @@ def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, arc
         "BackLog": cuadro["backlog"].to_numpy(),
         "Planning": cuadro["planning"].to_numpy(),
         "Done": cuadro["done"].to_numpy(),
-        "Desface": cuadro["defase"].to_numpy(),
+        "Desfase": cuadro["defase"].to_numpy(),
     })
     evento = st.dataframe(
         tabla[COLUMNAS_EXCEL],
@@ -207,7 +215,7 @@ def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, arc
             "BackLog": columna_numero("BackLog", "Tareas raíz en etapa Inicio"),
             "Planning": columna_numero("Planning", "Tareas raíz en Planeado o En ejecución, sin Hecho ni Cancelado"),
             "Done": columna_numero("Done", "Tareas raíz en etapa Finalizado"),
-            "Desface": columna_numero("Desface", "Contratadas − Acumulado − Mes"),
+            "Desfase": columna_numero("Desfase", "Contratadas − Acumulado − Mes"),
         },
     )
 
@@ -236,6 +244,134 @@ def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, arc
 # ─────────────────────────────────────────────
 # Período: desde el 1 de enero del año inicial hasta el día del reporte
 # ─────────────────────────────────────────────
+def _numeros(frame: pd.DataFrame, excluir: set[str]) -> dict:
+    return {
+        columna: st.column_config.NumberColumn(format="%.2f")
+        for columna in frame.columns if columna not in excluir
+    }
+
+
+def pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor: float):
+    """Comparativos de los últimos 6 meses y la foto de backlog por persona."""
+    st.caption(
+        "Los seis meses terminan en la fecha del reporte. "
+        "Las horas que ingresan son las vendidas de los proyectos que arrancan ese mes. "
+        "Las entregadas son las registradas en Odoo ese mes. "
+        "La productividad mira el backlog y las tareas ya finalizadas, no el parte de horas."
+    )
+    periodos = periodos_recientes(fecha_reporte, 6)
+    desde = periodos[0]["inicio"]
+    ingreso = serie_ingreso_entrega(proyectos, horas_reg, fecha_reporte, 6)
+    try:
+        extra, avisos_mov = load_movimientos(desde.isoformat(), fecha_reporte.isoformat())
+    except OdooError as exc:
+        extra, avisos_mov = pd.DataFrame(), [str(exc)]
+    for aviso in avisos_mov:
+        st.warning(aviso)
+    universo = proyectos
+    if extra is not None and not extra.empty:
+        extra = etiquetar(extra)
+        if not proyectos.empty:
+            extra = extra[~extra["project_id"].isin(set(proyectos["project_id"]))]
+        universo = pd.concat([proyectos, extra], ignore_index=True)
+
+    nombres = tuple(sorted({
+        str(nombre) for nombre in (acciones["usuario"].dropna().tolist() if not acciones.empty else [])
+        if nombre and nombre != "-"
+    }))
+    ids_emp: tuple[int, ...] = ()
+    if por_empleado is not None and not por_empleado.empty and "employee_id" in por_empleado.columns:
+        ids_emp = tuple(sorted({int(v) for v in por_empleado["employee_id"].dropna().tolist()}))
+    try:
+        plantilla = load_plantilla(ids_emp, nombres, desde.isoformat(), fecha_reporte.isoformat())
+    except OdooError as exc:
+        plantilla = None
+        st.warning(str(exc))
+    if plantilla:
+        for aviso in plantilla.get("warnings") or []:
+            if "factor" not in aviso:
+                st.warning(aviso)
+        capacidades = []
+        for periodo in periodos:
+            _, total = capacidad_periodo(
+                plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
+                periodo["inicio"], periodo["fin"], plantilla["tz"], factor,
+            )
+            capacidades.append(total)
+        ingreso["Capacidad"] = capacidades
+    else:
+        ingreso["Capacidad"] = None
+
+    st.markdown("**Horas que ingresan frente a las que se entregan**")
+    vista_horas = ingreso.drop(columns=[c for c in ("anio", "mes", "inicio", "fin") if c in ingreso.columns])
+    st.dataframe(vista_horas, hide_index=True, use_container_width=True, column_config=_numeros(vista_horas, {"Mes"}))
+
+    st.markdown("**Proyectos que se abren y proyectos que se cierran**")
+    aperturas = serie_apertura_cierre(universo, fecha_reporte, 6)
+    st.dataframe(aperturas, hide_index=True, use_container_width=True)
+
+    st.markdown("**Productividad por recurso**")
+    st.caption(
+        "Backlog y planeadas son la asignación actual en Odoo. "
+        "La salida ejecutada son las tareas que ya salieron a Finalizado. "
+        "Desfase positivo: esas horas no caben en la capacidad del mes."
+    )
+    capacidad_mes = {}
+    if plantilla:
+        capacidad_mes, _ = capacidad_periodo(
+            plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
+            date(fecha_reporte.year, fecha_reporte.month, 1), fecha_reporte,
+            plantilla["tz"], factor,
+        )
+    productividad = productividad_backlog(acciones, capacidad_mes)
+    if productividad.empty:
+        st.info("No hay horas de backlog asignadas a personas.")
+    else:
+        st.dataframe(
+            productividad, hide_index=True, use_container_width=True,
+            column_config=_numeros(productividad, {"Recurso"}),
+        )
+
+    st.markdown("**Eficiencia y tablero general de proyectos**")
+    st.caption(
+        "% avance = ejecutadas / vendidas. "
+        "Pendientes reales = vendidas − horas registradas desde el año inicial. "
+        "Desfase de horas = (registradas − vendidas) / vendidas. "
+        "Desfase de tiempo = atraso contra la fecha fin planeada / duración planeada."
+    )
+    salud = salud_proyectos(proyectos, horas_reg, fecha_reporte)
+    if salud.empty:
+        st.info("No hay proyectos para evaluar.")
+    else:
+        st.dataframe(
+            salud, hide_index=True, use_container_width=True,
+            column_config={
+                "Inicio": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "Fin planeado": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "Cierre real": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "H. vendidas": st.column_config.NumberColumn(format="%.2f"),
+                "H. ejecutadas": st.column_config.NumberColumn(format="%.2f"),
+                "H. pendientes": st.column_config.NumberColumn(format="%.2f"),
+                "Pendientes reales": st.column_config.NumberColumn(format="%.2f"),
+                "% avance": st.column_config.NumberColumn(format="%.0%"),
+                "Desfase horas %": st.column_config.NumberColumn(format="%.0%"),
+                "Desfase tiempo %": st.column_config.NumberColumn(format="%.0%"),
+            },
+        )
+
+    st.markdown("**Soporte: tickets y tiempo por criticidad**")
+    mensual_tk, criticidad, aviso_tk = load_tickets_resumen(desde.isoformat(), fecha_reporte.isoformat())
+    if aviso_tk:
+        st.info(aviso_tk)
+    else:
+        st.dataframe(mensual_tk, hide_index=True, use_container_width=True)
+        if not criticidad.empty:
+            st.dataframe(
+                criticidad, hide_index=True, use_container_width=True,
+                column_config={"Horas promedio": st.column_config.NumberColumn(format="%.1f")},
+            )
+
+
 st.sidebar.title("Ocupación TD")
 st.sidebar.caption("Cuadro de proyectos desde Odoo")
 
@@ -510,11 +646,13 @@ st.caption(
     f"Desde el 1 de enero de {int(anio)} hasta el {fecha_reporte:%d/%m/%Y}, "
     "día del reporte. Acumulado es lo registrado hasta el mes anterior. "
     "Mes es el mes de la fecha del reporte, hasta ese día. "
-    "Desface = Contratadas − Acumulado − Mes. "
+    "Desfase = Contratadas − Acumulado − Mes. "
     "Las bolsas de horas están en su propia pestaña, por la etiqueta Bolsa de Horas."
 )
 
-tab_proyectos, tab_bolsas, tab_mes = st.tabs(["Proyectos", "Bolsas de horas", "Mes"])
+tab_proyectos, tab_bolsas, tab_mes, tab_analisis = st.tabs(
+    ["Proyectos", "Bolsas de horas", "Mes", "Análisis"]
+)
 with tab_proyectos:
     st.caption("Proyectos sin la etiqueta Bolsa de Horas.")
     pintar_cuadro(
@@ -533,3 +671,5 @@ with tab_bolsas:
     )
 with tab_mes:
     pintar_mes(proyectos, acciones, por_empleado, fecha_reporte, factor, filtro_etapa, buscar)
+with tab_analisis:
+    pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor)
