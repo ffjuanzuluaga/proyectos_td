@@ -22,7 +22,6 @@ from odoo_io import (
     es_bolsa_de_horas,
     load_extra_projects,
     load_horas_equipo,
-    load_horas_facturadas,
     load_movimientos,
     load_plantilla,
     load_registered,
@@ -33,6 +32,7 @@ from odoo_io import (
     serie_apertura_cierre,
     serie_ingreso_entrega,
 )
+import odoo_io
 
 st.set_page_config(
     page_title="Ocupación de proyectos · Transformación Digital",
@@ -252,6 +252,45 @@ def _numeros(frame: pd.DataFrame, excluir: set[str]) -> dict:
     }
 
 
+def _horas_facturadas(date_from: str, date_to: str):
+    """Usa la función de odoo_io si el despliegue ya la trae; si no, consulta Odoo aquí."""
+    fn = getattr(odoo_io, "load_horas_facturadas", None)
+    if callable(fn):
+        return fn(date_from, date_to)
+    vacio = pd.DataFrame(columns=["anio", "mes", "horas"])
+    cfg, _, _, _ = odoo_io.get_connection()
+    campos = odoo_io._pick(
+        "account.analytic.line",
+        ["date", "unit_amount", "timesheet_invoice_id", "project_id"],
+    )
+    if "timesheet_invoice_id" not in campos:
+        return vacio, "Odoo no marca qué horas del parte ya se facturaron."
+    dominio = [
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+        ("unit_amount", ">", 0),
+        ("timesheet_invoice_id", "!=", False),
+        ("project_id.service_line", "=", cfg["service_line"]),
+    ]
+    try:
+        lineas = odoo_io.search_read("account.analytic.line", dominio, ["date", "unit_amount"])
+    except OdooError as exc:
+        return vacio, str(exc)
+    if not lineas:
+        return vacio, None
+    frame = pd.DataFrame(lineas)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame[frame["date"].notna()]
+    if frame.empty:
+        return vacio, None
+    frame["anio"] = frame["date"].dt.year.astype(int)
+    frame["mes"] = frame["date"].dt.month.astype(int)
+    frame["horas"] = frame["unit_amount"].map(odoo_io._num)
+    agrupado = frame.groupby(["anio", "mes"], as_index=False)["horas"].sum()
+    agrupado["horas"] = agrupado["horas"].map(odoo_io._round2)
+    return agrupado, None
+
+
 def _grafica_vendidas(frame: pd.DataFrame):
     series = [nombre for nombre in ("Vendidas", "Facturadas proyectos", "Entregadas proyectos") if nombre in frame.columns]
     largo = frame.melt(id_vars="Mes", value_vars=series, var_name="Serie", value_name="Horas")
@@ -317,7 +356,7 @@ def _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte
     ingreso["Vendidas"] = ingreso["Horas que ingresan"]
     ingreso["Entregadas proyectos"] = ingreso["Horas entregadas"]
     try:
-        facturadas, aviso_fac = load_horas_facturadas(desde.isoformat(), fecha_reporte.isoformat())
+        facturadas, aviso_fac = _horas_facturadas(desde.isoformat(), fecha_reporte.isoformat())
         if aviso_fac:
             st.caption(aviso_fac)
         if facturadas is not None and not facturadas.empty:
