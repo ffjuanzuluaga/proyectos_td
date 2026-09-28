@@ -1,11 +1,12 @@
 [project]
-name = "blank-app-template"
+name = "proyectos-td"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "Ocupación de proyectos de Transformación Digital (Odoo 19) para Firefly."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
-    "streamlit>=1.61.1",
+    "streamlit>=1.36",
+    "pandas>=2.2",
 ]
 
 [tool.uv]
