@@ -1573,55 +1573,77 @@ def load_horas_equipo(employee_ids: tuple[int, ...], date_from: str, date_to: st
 
 @st.cache_data(ttl=600, show_spinner="Cargando tickets de soporte...")
 def load_tickets_resumen(date_from: str, date_to: str) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
-    """Tickets creados o cerrados en el rango, y demora media por criticidad."""
+    """Conteos mensuales y promedio de atención, sin bajar ticket por ticket."""
     vacio = pd.DataFrame()
+    desde = f"{date_from} 00:00:00"
+    hasta = f"{date_to} 23:59:59"
+    etiquetas = {"0": "Baja", "1": "Media", "2": "Alta", "3": "Urgente"}
     try:
-        campos = _pick("helpdesk.ticket", ["create_date", "close_date", "priority", "close_hours"])
+        info = odoo_call("helpdesk.ticket", "fields_get", [["priority", "close_hours", "create_date", "close_date"]], {"attributes": ["selection"]})
     except OdooError as exc:
         return vacio, vacio, str(exc)
-    if "create_date" not in campos:
-        return vacio, vacio, "Este usuario no puede leer helpdesk.ticket."
-    dominio = [
-        "|",
-        "&", ("create_date", ">=", f"{date_from} 00:00:00"), ("create_date", "<=", f"{date_to} 23:59:59"),
-        "&", ("close_date", ">=", f"{date_from} 00:00:00"), ("close_date", "<=", f"{date_to} 23:59:59"),
-    ]
-    try:
-        registros = search_read("helpdesk.ticket", dominio, campos, order="id")
-        etiquetas = {"0": "Baja", "1": "Media", "2": "Alta", "3": "Urgente"}
-        info = odoo_call("helpdesk.ticket", "fields_get", [["priority"]], {"attributes": ["selection"]})
-        seleccion = info.get("priority", {}).get("selection") or []
-        if seleccion:
-            etiquetas = {str(clave): texto for clave, texto in seleccion}
-    except OdooError as exc:
-        return vacio, vacio, str(exc)
-    if not registros:
-        return vacio, vacio, None
-    frame = pd.DataFrame(registros)
-    frame["create_date"] = pd.to_datetime(frame.get("create_date"), errors="coerce")
-    frame["close_date"] = pd.to_datetime(frame.get("close_date"), errors="coerce")
-    desde = pd.Timestamp(date_from)
-    hasta = pd.Timestamp(date_to) + pd.Timedelta(days=1)
-    abiertos = frame[frame["create_date"].between(desde, hasta, inclusive="left")].copy()
-    cerrados = frame[frame["close_date"].between(desde, hasta, inclusive="left")].copy()
-    if not abiertos.empty:
-        abiertos["periodo"] = abiertos["create_date"].dt.to_period("M").astype(str)
-    if not cerrados.empty:
-        cerrados["periodo"] = cerrados["close_date"].dt.to_period("M").astype(str)
-    meses = sorted(set(abiertos["periodo"] if not abiertos.empty else []) | set(cerrados["periodo"] if not cerrados.empty else []))
-    mensual = pd.DataFrame({
-        "Mes": meses,
-        "Abiertos": [int((abiertos["periodo"] == mes).sum()) if not abiertos.empty else 0 for mes in meses],
-        "Cerrados": [int((cerrados["periodo"] == mes).sum()) if not cerrados.empty else 0 for mes in meses],
-    })
-    if cerrados.empty or "close_hours" not in cerrados.columns:
-        criticidad = pd.DataFrame(columns=["Criticidad", "Tickets cerrados", "Horas promedio"])
-    else:
-        cerrados["Criticidad"] = cerrados["priority"].map(lambda v: etiquetas.get(str(v), str(v or "Sin prioridad")))
-        criticidad = (
-            cerrados.groupby("Criticidad", as_index=False)
-            .agg(**{"Tickets cerrados": ("priority", "size"), "Horas promedio": ("close_hours", "mean")})
+    if not info:
+        return vacio, vacio, "Este usuario no puede leer los tickets de soporte."
+    seleccion = (info.get("priority") or {}).get("selection") or []
+    if seleccion:
+        etiquetas = {str(clave): texto for clave, texto in seleccion}
+
+    def grupos(campo: str) -> list[dict]:
+        return odoo_call(
+            "helpdesk.ticket",
+            "read_group",
+            [[(campo, ">=", desde), (campo, "<=", hasta)], ["__count"], [f"{campo}:month"]],
+            {"lazy": False},
         )
-        criticidad["Horas promedio"] = criticidad["Horas promedio"].map(lambda v: _round2(v) if pd.notna(v) else None)
+
+    def periodo_de(fila: dict, campo: str) -> str:
+        rango = (fila.get("__range") or {}).get(campo) or {}
+        if rango.get("from"):
+            return str(rango["from"])[:7]
+        return str(fila.get(f"{campo}:month") or "")
+
+    try:
+        abiertos = grupos("create_date")
+        cerrados = grupos("close_date") if "close_date" in info else []
+    except OdooError as exc:
+        return vacio, vacio, str(exc)
+    conteo: dict[str, dict[str, int]] = {}
+    for fila in abiertos:
+        clave = periodo_de(fila, "create_date")
+        conteo.setdefault(clave, {"Abiertos": 0, "Cerrados": 0})
+        conteo[clave]["Abiertos"] = int(fila.get("__count") or fila.get("create_date_count") or 0)
+    for fila in cerrados:
+        clave = periodo_de(fila, "close_date")
+        conteo.setdefault(clave, {"Abiertos": 0, "Cerrados": 0})
+        conteo[clave]["Cerrados"] = int(fila.get("__count") or fila.get("close_date_count") or 0)
+    mensual = pd.DataFrame(
+        [{"Mes": mes, **valores} for mes, valores in sorted(conteo.items()) if mes]
+    )
+    criticidad = vacio
+    if "close_hours" in info and "priority" in info:
+        try:
+            por_prioridad = odoo_call(
+                "helpdesk.ticket",
+                "read_group",
+                [[
+                    ("close_date", ">=", desde),
+                    ("close_date", "<=", hasta),
+                    ("close_hours", "!=", False),
+                ], ["close_hours"], ["priority"]],
+                {"lazy": False},
+            )
+        except OdooError:
+            por_prioridad = []
+        filas = []
+        for fila in por_prioridad:
+            clave = fila.get("priority")
+            if isinstance(clave, (list, tuple)):
+                clave = clave[0]
+            filas.append({
+                "Criticidad": etiquetas.get(str(clave), str(clave or "Sin prioridad")),
+                "Tickets cerrados": int(fila.get("__count") or fila.get("priority_count") or 0),
+                "Horas promedio": _round2(fila.get("close_hours") or 0),
+            })
+        criticidad = pd.DataFrame(filas)
     return mensual, criticidad, None
 

@@ -252,63 +252,28 @@ def _numeros(frame: pd.DataFrame, excluir: set[str]) -> dict:
 
 
 def pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor: float):
-    """Comparativos de los últimos 6 meses y la foto de backlog por persona."""
+    """Comparativos con los datos ya cargados. Las consultas extra van al final."""
+    try:
+        _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor)
+    except Exception as exc:
+        st.error("El análisis no pudo armarse con los datos de Odoo.")
+        st.exception(exc)
+
+
+def _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor: float):
     st.caption(
         "Los seis meses terminan en la fecha del reporte. "
         "Las horas que ingresan son las vendidas de los proyectos que arrancan ese mes. "
         "Las entregadas son las registradas en Odoo ese mes. "
         "La productividad mira el backlog y las tareas ya finalizadas, no el parte de horas."
     )
-    periodos = periodos_recientes(fecha_reporte, 6)
-    desde = periodos[0]["inicio"]
     ingreso = serie_ingreso_entrega(proyectos, horas_reg, fecha_reporte, 6)
-    try:
-        extra, avisos_mov = load_movimientos(desde.isoformat(), fecha_reporte.isoformat())
-    except OdooError as exc:
-        extra, avisos_mov = pd.DataFrame(), [str(exc)]
-    for aviso in avisos_mov:
-        st.warning(aviso)
-    universo = proyectos
-    if extra is not None and not extra.empty:
-        extra = etiquetar(extra)
-        if not proyectos.empty:
-            extra = extra[~extra["project_id"].isin(set(proyectos["project_id"]))]
-        universo = pd.concat([proyectos, extra], ignore_index=True)
-
-    nombres = tuple(sorted({
-        str(nombre) for nombre in (acciones["usuario"].dropna().tolist() if not acciones.empty else [])
-        if nombre and nombre != "-"
-    }))
-    ids_emp: tuple[int, ...] = ()
-    if por_empleado is not None and not por_empleado.empty and "employee_id" in por_empleado.columns:
-        ids_emp = tuple(sorted({int(v) for v in por_empleado["employee_id"].dropna().tolist()}))
-    try:
-        plantilla = load_plantilla(ids_emp, nombres, desde.isoformat(), fecha_reporte.isoformat())
-    except OdooError as exc:
-        plantilla = None
-        st.warning(str(exc))
-    if plantilla:
-        for aviso in plantilla.get("warnings") or []:
-            if "factor" not in aviso:
-                st.warning(aviso)
-        capacidades = []
-        for periodo in periodos:
-            _, total = capacidad_periodo(
-                plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
-                periodo["inicio"], periodo["fin"], plantilla["tz"], factor,
-            )
-            capacidades.append(total)
-        ingreso["Capacidad"] = capacidades
-    else:
-        ingreso["Capacidad"] = None
-
     st.markdown("**Horas que ingresan frente a las que se entregan**")
     vista_horas = ingreso.drop(columns=[c for c in ("anio", "mes", "inicio", "fin") if c in ingreso.columns])
     st.dataframe(vista_horas, hide_index=True, use_container_width=True, column_config=_numeros(vista_horas, {"Mes"}))
 
     st.markdown("**Proyectos que se abren y proyectos que se cierran**")
-    aperturas = serie_apertura_cierre(universo, fecha_reporte, 6)
-    st.dataframe(aperturas, hide_index=True, use_container_width=True)
+    st.dataframe(serie_apertura_cierre(proyectos, fecha_reporte, 6), hide_index=True, use_container_width=True)
 
     st.markdown("**Productividad por recurso**")
     st.caption(
@@ -316,13 +281,33 @@ def pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte,
         "La salida ejecutada son las tareas que ya salieron a Finalizado. "
         "Desfase positivo: esas horas no caben en la capacidad del mes."
     )
-    capacidad_mes = {}
-    if plantilla:
+    nombres = tuple(sorted({
+        str(nombre) for nombre in (acciones["usuario"].dropna().tolist() if acciones is not None and not acciones.empty else [])
+        if nombre and nombre != "-"
+    }))[:60]
+    del_mes = pd.DataFrame()
+    if por_empleado is not None and not por_empleado.empty:
+        del_mes = por_empleado[(por_empleado["anio"] == fecha_reporte.year) & (por_empleado["mes"] == fecha_reporte.month)]
+    ids_emp = tuple(sorted({
+        int(valor) for valor in (del_mes["employee_id"].dropna().tolist() if not del_mes.empty and "employee_id" in del_mes.columns else [])
+    }))[:60]
+    capacidad_mes: dict[str, float] = {}
+    try:
+        plantilla = load_plantilla(
+            ids_emp, nombres,
+            date(fecha_reporte.year, fecha_reporte.month, 1).isoformat(),
+            fecha_reporte.isoformat(),
+        )
+        for aviso in plantilla.get("warnings") or []:
+            if "factor" not in aviso:
+                st.warning(aviso)
         capacidad_mes, _ = capacidad_periodo(
             plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
             date(fecha_reporte.year, fecha_reporte.month, 1), fecha_reporte,
             plantilla["tz"], factor,
         )
+    except OdooError as exc:
+        st.warning(str(exc))
     productividad = productividad_backlog(acciones, capacidad_mes)
     if productividad.empty:
         st.info("No hay horas de backlog asignadas a personas.")
@@ -360,12 +345,16 @@ def pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte,
         )
 
     st.markdown("**Soporte: tickets y tiempo por criticidad**")
+    desde = periodos_recientes(fecha_reporte, 6)[0]["inicio"]
     mensual_tk, criticidad, aviso_tk = load_tickets_resumen(desde.isoformat(), fecha_reporte.isoformat())
     if aviso_tk:
         st.info(aviso_tk)
+    elif mensual_tk.empty and criticidad.empty:
+        st.info("No hay tickets en estos seis meses.")
     else:
-        st.dataframe(mensual_tk, hide_index=True, use_container_width=True)
-        if not criticidad.empty:
+        if not mensual_tk.empty:
+            st.dataframe(mensual_tk, hide_index=True, use_container_width=True)
+        if criticidad is not None and not criticidad.empty:
             st.dataframe(
                 criticidad, hide_index=True, use_container_width=True,
                 column_config={"Horas promedio": st.column_config.NumberColumn(format="%.1f")},
