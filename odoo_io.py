@@ -676,6 +676,39 @@ def _descuento_ausencia(inicio_local, fin_local, dia: date, programadas: float) 
     return programadas
 
 
+def _indice_ausencias(ausencias, tz: ZoneInfo, inicio: date, fin: date):
+    festivos_global: set[date] = set()
+    festivos_cal: dict[int, set[date]] = {}
+    por_recurso: dict[int, dict] = {}
+    for ausencia in ausencias or []:
+        inicio_local = _a_local(ausencia.get("date_from"), tz)
+        fin_local = _a_local(ausencia.get("date_to"), tz)
+        dias = [dia for dia in _fechas_cubiertas(inicio_local, fin_local) if inicio <= dia <= fin]
+        if not dias:
+            continue
+        if not ausencia.get("resource_id"):
+            cal = ausencia.get("calendar_id")
+            if cal:
+                festivos_cal.setdefault(int(cal), set()).update(dias)
+            else:
+                festivos_global.update(dias)
+            continue
+        recurso = int(ausencia["resource_id"])
+        bolsillo = por_recurso.setdefault(recurso, {})
+        parcial = None
+        if inicio_local and fin_local and inicio_local.date() == fin_local.date():
+            duracion = (fin_local - inicio_local).total_seconds() / 3600
+            if 0 < duracion < 12:
+                parcial = duracion
+        for dia in dias:
+            if parcial is None:
+                bolsillo[dia] = "completo"
+            else:
+                anterior = bolsillo.get(dia)
+                bolsillo[dia] = parcial if anterior in (None, "completo") else float(anterior) + parcial
+    return festivos_global, festivos_cal, por_recurso
+
+
 def capacidad_empleado(
     calendar_id: int | None,
     resource_id: int | None,
@@ -691,35 +724,22 @@ def capacidad_empleado(
         tz = ZoneInfo(tz_name or "America/Bogota")
     except Exception:
         tz = ZoneInfo("America/Bogota")
+    festivos_global, festivos_cal, por_recurso = _indice_ausencias(ausencias, tz, inicio, fin)
+    propios = por_recurso.get(int(resource_id or 0), {})
     horario = festivos = personales = 0.0
     cursor = inicio
     while cursor <= fin:
         programadas = _horas_del_dia(cursor, calendar_id, asistencia)
         horario += programadas
         if programadas:
-            es_festivo = False
-            for ausencia in ausencias:
-                if ausencia.get("resource_id"):
-                    continue
-                cal = ausencia.get("calendar_id")
-                if cal and int(cal) != int(calendar_id or 0):
-                    continue
-                inicio_local = _a_local(ausencia.get("date_from"), tz)
-                fin_local = _a_local(ausencia.get("date_to"), tz)
-                if cursor in _fechas_cubiertas(inicio_local, fin_local):
-                    es_festivo = True
-                    break
-            if es_festivo:
+            if cursor in festivos_global or cursor in festivos_cal.get(int(calendar_id or 0), ()):
                 festivos += programadas
             else:
-                descuento = 0.0
-                for ausencia in ausencias:
-                    if not resource_id or int(ausencia.get("resource_id") or 0) != int(resource_id):
-                        continue
-                    inicio_local = _a_local(ausencia.get("date_from"), tz)
-                    fin_local = _a_local(ausencia.get("date_to"), tz)
-                    descuento += _descuento_ausencia(inicio_local, fin_local, cursor, programadas)
-                personales += min(descuento, programadas)
+                descuento = propios.get(cursor)
+                if descuento == "completo":
+                    personales += programadas
+                elif descuento:
+                    personales += min(float(descuento), programadas)
         cursor += timedelta(days=1)
     laborales = max(0.0, horario - festivos - personales)
     return {
@@ -1571,79 +1591,36 @@ def load_horas_equipo(employee_ids: tuple[int, ...], date_from: str, date_to: st
     return build_horas_empleado(rows)
 
 
-@st.cache_data(ttl=600, show_spinner="Cargando tickets de soporte...")
-def load_tickets_resumen(date_from: str, date_to: str) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
-    """Conteos mensuales y promedio de atención, sin bajar ticket por ticket."""
-    vacio = pd.DataFrame()
-    desde = f"{date_from} 00:00:00"
-    hasta = f"{date_to} 23:59:59"
-    etiquetas = {"0": "Baja", "1": "Media", "2": "Alta", "3": "Urgente"}
+@st.cache_data(ttl=600, show_spinner=False)
+def load_horas_facturadas(date_from: str, date_to: str) -> tuple[pd.DataFrame, str | None]:
+    """Horas de parte que ya tienen factura, por mes de la fecha del parte."""
+    vacio = pd.DataFrame(columns=["anio", "mes", "horas"])
+    cfg, _, _, _ = get_connection()
+    campos = _pick("account.analytic.line", ["date", "unit_amount", "timesheet_invoice_id", "project_id"])
+    if "timesheet_invoice_id" not in campos:
+        return vacio, "Odoo no marca qué horas del parte ya se facturaron."
+    dominio = [
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+        ("unit_amount", ">", 0),
+        ("timesheet_invoice_id", "!=", False),
+        ("project_id.service_line", "=", cfg["service_line"]),
+    ]
     try:
-        info = odoo_call("helpdesk.ticket", "fields_get", [["priority", "close_hours", "create_date", "close_date"]], {"attributes": ["selection"]})
+        lineas = search_read("account.analytic.line", dominio, ["date", "unit_amount"])
     except OdooError as exc:
-        return vacio, vacio, str(exc)
-    if not info:
-        return vacio, vacio, "Este usuario no puede leer los tickets de soporte."
-    seleccion = (info.get("priority") or {}).get("selection") or []
-    if seleccion:
-        etiquetas = {str(clave): texto for clave, texto in seleccion}
-
-    def grupos(campo: str) -> list[dict]:
-        return odoo_call(
-            "helpdesk.ticket",
-            "read_group",
-            [[(campo, ">=", desde), (campo, "<=", hasta)], ["__count"], [f"{campo}:month"]],
-            {"lazy": False},
-        )
-
-    def periodo_de(fila: dict, campo: str) -> str:
-        rango = (fila.get("__range") or {}).get(campo) or {}
-        if rango.get("from"):
-            return str(rango["from"])[:7]
-        return str(fila.get(f"{campo}:month") or "")
-
-    try:
-        abiertos = grupos("create_date")
-        cerrados = grupos("close_date") if "close_date" in info else []
-    except OdooError as exc:
-        return vacio, vacio, str(exc)
-    conteo: dict[str, dict[str, int]] = {}
-    for fila in abiertos:
-        clave = periodo_de(fila, "create_date")
-        conteo.setdefault(clave, {"Abiertos": 0, "Cerrados": 0})
-        conteo[clave]["Abiertos"] = int(fila.get("__count") or fila.get("create_date_count") or 0)
-    for fila in cerrados:
-        clave = periodo_de(fila, "close_date")
-        conteo.setdefault(clave, {"Abiertos": 0, "Cerrados": 0})
-        conteo[clave]["Cerrados"] = int(fila.get("__count") or fila.get("close_date_count") or 0)
-    mensual = pd.DataFrame(
-        [{"Mes": mes, **valores} for mes, valores in sorted(conteo.items()) if mes]
-    )
-    criticidad = vacio
-    if "close_hours" in info and "priority" in info:
-        try:
-            por_prioridad = odoo_call(
-                "helpdesk.ticket",
-                "read_group",
-                [[
-                    ("close_date", ">=", desde),
-                    ("close_date", "<=", hasta),
-                    ("close_hours", "!=", False),
-                ], ["close_hours"], ["priority"]],
-                {"lazy": False},
-            )
-        except OdooError:
-            por_prioridad = []
-        filas = []
-        for fila in por_prioridad:
-            clave = fila.get("priority")
-            if isinstance(clave, (list, tuple)):
-                clave = clave[0]
-            filas.append({
-                "Criticidad": etiquetas.get(str(clave), str(clave or "Sin prioridad")),
-                "Tickets cerrados": int(fila.get("__count") or fila.get("priority_count") or 0),
-                "Horas promedio": _round2(fila.get("close_hours") or 0),
-            })
-        criticidad = pd.DataFrame(filas)
-    return mensual, criticidad, None
+        return vacio, str(exc)
+    if not lineas:
+        return vacio, None
+    frame = pd.DataFrame(lineas)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame[frame["date"].notna()]
+    if frame.empty:
+        return vacio, None
+    frame["anio"] = frame["date"].dt.year.astype(int)
+    frame["mes"] = frame["date"].dt.month.astype(int)
+    frame["horas"] = frame["unit_amount"].map(_num)
+    agrupado = frame.groupby(["anio", "mes"], as_index=False)["horas"].sum()
+    agrupado["horas"] = agrupado["horas"].map(_round2)
+    return agrupado, None
 

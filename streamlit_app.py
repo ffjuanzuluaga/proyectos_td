@@ -9,6 +9,7 @@ Secrets en `.streamlit/secrets.toml` (local) o en Settings → Secrets (Cloud).
 
 from datetime import date, datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -21,11 +22,11 @@ from odoo_io import (
     es_bolsa_de_horas,
     load_extra_projects,
     load_horas_equipo,
+    load_horas_facturadas,
     load_movimientos,
     load_plantilla,
     load_registered,
     load_snapshot,
-    load_tickets_resumen,
     periodos_recientes,
     productividad_backlog,
     salud_proyectos,
@@ -251,6 +252,38 @@ def _numeros(frame: pd.DataFrame, excluir: set[str]) -> dict:
     }
 
 
+def _grafica_vendidas(frame: pd.DataFrame):
+    series = [nombre for nombre in ("Vendidas", "Facturadas proyectos", "Entregadas proyectos") if nombre in frame.columns]
+    largo = frame.melt(id_vars="Mes", value_vars=series, var_name="Serie", value_name="Horas")
+    orden = list(frame["Mes"])
+    barras = alt.Chart(largo).mark_bar().encode(
+        x=alt.X("Mes:N", sort=orden, title=None),
+        y=alt.Y("Horas:Q", title="Horas"),
+        color=alt.Color(
+            "Serie:N",
+            scale=alt.Scale(
+                domain=["Vendidas", "Facturadas proyectos", "Entregadas proyectos"],
+                range=["#7cb342", "#1e88e5", "#f9a825"],
+            ),
+            legend=alt.Legend(title=None, orient="bottom"),
+        ),
+        xOffset="Serie:N",
+        tooltip=["Mes", "Serie", alt.Tooltip("Horas:Q", format=".1f")],
+    )
+    grafica = barras
+    if "Capacidad" in frame.columns and frame["Capacidad"].notna().any():
+        linea = alt.Chart(frame).mark_line(color="#4fc3f7", point=True, strokeWidth=3).encode(
+            x=alt.X("Mes:N", sort=orden),
+            y=alt.Y("Capacidad:Q"),
+            tooltip=["Mes", alt.Tooltip("Capacidad:Q", format=".1f", title="Capacidad")],
+        )
+        grafica = barras + linea
+    st.altair_chart(
+        grafica.properties(height=380, title="Horas vendidas vs horas entregadas"),
+        use_container_width=True,
+    )
+
+
 def pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte, factor: float):
     """Comparativos con los datos ya cargados. Las consultas extra van al final."""
     try:
@@ -268,19 +301,8 @@ def _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte
         "La productividad mira el backlog y las tareas ya finalizadas, no el parte de horas."
     )
     ingreso = serie_ingreso_entrega(proyectos, horas_reg, fecha_reporte, 6)
-    st.markdown("**Horas que ingresan frente a las que se entregan**")
-    vista_horas = ingreso.drop(columns=[c for c in ("anio", "mes", "inicio", "fin") if c in ingreso.columns])
-    st.dataframe(vista_horas, hide_index=True, use_container_width=True, column_config=_numeros(vista_horas, {"Mes"}))
-
-    st.markdown("**Proyectos que se abren y proyectos que se cierran**")
-    st.dataframe(serie_apertura_cierre(proyectos, fecha_reporte, 6), hide_index=True, use_container_width=True)
-
-    st.markdown("**Productividad por recurso**")
-    st.caption(
-        "Backlog y planeadas son la asignación actual en Odoo. "
-        "La salida ejecutada son las tareas que ya salieron a Finalizado. "
-        "Desfase positivo: esas horas no caben en la capacidad del mes."
-    )
+    periodos = periodos_recientes(fecha_reporte, 6)
+    desde = periodos[0]["inicio"]
     nombres = tuple(sorted({
         str(nombre) for nombre in (acciones["usuario"].dropna().tolist() if acciones is not None and not acciones.empty else [])
         if nombre and nombre != "-"
@@ -292,22 +314,52 @@ def _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte
         int(valor) for valor in (del_mes["employee_id"].dropna().tolist() if not del_mes.empty and "employee_id" in del_mes.columns else [])
     }))[:60]
     capacidad_mes: dict[str, float] = {}
+    ingreso["Vendidas"] = ingreso["Horas que ingresan"]
+    ingreso["Entregadas proyectos"] = ingreso["Horas entregadas"]
     try:
-        plantilla = load_plantilla(
-            ids_emp, nombres,
-            date(fecha_reporte.year, fecha_reporte.month, 1).isoformat(),
-            fecha_reporte.isoformat(),
-        )
+        facturadas, aviso_fac = load_horas_facturadas(desde.isoformat(), fecha_reporte.isoformat())
+        if aviso_fac:
+            st.caption(aviso_fac)
+        if facturadas is not None and not facturadas.empty:
+            mapa = {(int(r.anio), int(r.mes)): float(r.horas) for r in facturadas.itertuples(index=False)}
+            ingreso["Facturadas proyectos"] = [
+                mapa.get((int(fila.anio), int(fila.mes)), 0.0) for fila in ingreso.itertuples(index=False)
+            ]
+    except OdooError as exc:
+        st.caption(str(exc))
+    try:
+        plantilla = load_plantilla(ids_emp, nombres, desde.isoformat(), fecha_reporte.isoformat())
         for aviso in plantilla.get("warnings") or []:
             if "factor" not in aviso:
                 st.warning(aviso)
-        capacidad_mes, _ = capacidad_periodo(
-            plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
-            date(fecha_reporte.year, fecha_reporte.month, 1), fecha_reporte,
-            plantilla["tz"], factor,
-        )
+        totales = []
+        for periodo in periodos:
+            por_nombre, total = capacidad_periodo(
+                plantilla["empleados"], plantilla["asistencia"], plantilla["ausencias"],
+                periodo["inicio"], periodo["fin"], plantilla["tz"], factor,
+            )
+            totales.append(total)
+            if (periodo["anio"], periodo["mes"]) == (fecha_reporte.year, fecha_reporte.month):
+                capacidad_mes = por_nombre
+        ingreso["Capacidad"] = totales
     except OdooError as exc:
         st.warning(str(exc))
+
+    st.markdown("**Horas vendidas vs horas entregadas**")
+    _grafica_vendidas(ingreso)
+    columnas = ["Mes", "Vendidas", "Facturadas proyectos", "Entregadas proyectos", "Capacidad"]
+    vista_horas = ingreso[[col for col in columnas if col in ingreso.columns]]
+    st.dataframe(vista_horas, hide_index=True, use_container_width=True, column_config=_numeros(vista_horas, {"Mes"}))
+
+    st.markdown("**Proyectos que se abren y proyectos que se cierran**")
+    st.dataframe(serie_apertura_cierre(proyectos, fecha_reporte, 6), hide_index=True, use_container_width=True)
+
+    st.markdown("**Productividad por recurso**")
+    st.caption(
+        "Backlog y planeadas son la asignación actual en Odoo. "
+        "La salida ejecutada son las tareas que ya salieron a Finalizado. "
+        "Desfase positivo: esas horas no caben en la capacidad del mes."
+    )
     productividad = productividad_backlog(acciones, capacidad_mes)
     if productividad.empty:
         st.info("No hay horas de backlog asignadas a personas.")
@@ -343,22 +395,6 @@ def _pintar_analisis(proyectos, acciones, horas_reg, por_empleado, fecha_reporte
                 "Desfase tiempo %": st.column_config.NumberColumn(format="%.0%"),
             },
         )
-
-    st.markdown("**Soporte: tickets y tiempo por criticidad**")
-    desde = periodos_recientes(fecha_reporte, 6)[0]["inicio"]
-    mensual_tk, criticidad, aviso_tk = load_tickets_resumen(desde.isoformat(), fecha_reporte.isoformat())
-    if aviso_tk:
-        st.info(aviso_tk)
-    elif mensual_tk.empty and criticidad.empty:
-        st.info("No hay tickets en estos seis meses.")
-    else:
-        if not mensual_tk.empty:
-            st.dataframe(mensual_tk, hide_index=True, use_container_width=True)
-        if criticidad is not None and not criticidad.empty:
-            st.dataframe(
-                criticidad, hide_index=True, use_container_width=True,
-                column_config={"Horas promedio": st.column_config.NumberColumn(format="%.1f")},
-            )
 
 
 st.sidebar.title("Ocupación TD")
