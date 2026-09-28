@@ -2,7 +2,7 @@
 """Cuadro de ocupación de Transformación Digital, leído de Odoo por XML-RPC.
 
 La tabla sigue la hoja de seguimiento: Contratadas, Acumulado, Mes, BackLog,
-Planning, Done y DeFase. Al seleccionar un proyecto se despliega el detalle.
+Planning, Done y Desface. Al marcar un proyecto se despliega el detalle.
 
 Secrets en `.streamlit/secrets.toml` (local) o en Settings → Secrets (Cloud).
 """
@@ -19,6 +19,7 @@ from odoo_io import (
     cuadro_reporte,
     es_bolsa_de_horas,
     load_extra_projects,
+    load_horas_equipo,
     load_movimientos,
     load_plantilla,
     load_registered,
@@ -34,9 +35,9 @@ st.set_page_config(
 COLUMNAS_EXCEL = [
     "Proyecto", "Etapa Proyecto", "Fecha de Inicio", "Fecha de Fin", "Etiquetas",
     "Vendedor", "Gerente", "Pry Cierre", "Rapidez", "Asignadas", "Contratadas",
-    "Acumulado", "Mes", "BackLog", "Planning", "Done", "DeFase",
+    "Acumulado", "Mes", "BackLog", "Planning", "Done", "Desface",
 ]
-HORAS = ["Asignadas", "Contratadas", "Acumulado", "Mes", "BackLog", "Planning", "Done", "DeFase"]
+HORAS = ["Asignadas", "Contratadas", "Acumulado", "Mes", "BackLog", "Planning", "Done", "Desface"]
 
 
 def csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -67,88 +68,14 @@ def columna_numero(nombre: str, ayuda: str | None = None):
     return st.column_config.NumberColumn(nombre, format="%.2f", help=ayuda)
 
 
-def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, archivo: str, vacio: str):
-    """Tabla del cuadro y, al seleccionar una fila, el detalle del proyecto."""
-    cuadro = cuadro_reporte(proyectos, horas_reg, fecha_reporte)
-    if cuadro.empty:
-        st.info(vacio)
-        return
+def columna_numero(nombre: str, ayuda: str | None = None):
+    return st.column_config.NumberColumn(nombre, format="%.2f", help=ayuda)
 
-    base = proyectos.drop_duplicates("project_id").set_index("project_id")
-    ids = cuadro["project_id"]
 
-    def traer(columna):
-        return ids.map(base[columna]) if columna in base.columns else None
-
-    tabla = pd.DataFrame({
-        "Proyecto": cuadro["proyecto_ui"].to_numpy(),
-        "Etapa Proyecto": cuadro["etapa_proyecto"].to_numpy(),
-        "Fecha de Inicio": traer("fecha_inicio").to_numpy(),
-        "Fecha de Fin": traer("fecha_fin").to_numpy(),
-        "Etiquetas": traer("etiquetas").to_numpy(),
-        "Vendedor": traer("vendedor").to_numpy(),
-        "Gerente": traer("gerente").to_numpy(),
-        "Pry Cierre": traer("fecha_real_cierre").to_numpy(),
-        "Rapidez": traer("rapidez").to_numpy(),
-        "Asignadas": traer("horas_tareas").to_numpy(),
-        "Contratadas": cuadro["contratadas"].to_numpy(),
-        "Acumulado": cuadro["acumulado"].to_numpy(),
-        "Mes": cuadro["mes"].to_numpy(),
-        "BackLog": cuadro["backlog"].to_numpy(),
-        "Planning": cuadro["planning"].to_numpy(),
-        "Done": cuadro["done"].to_numpy(),
-        "DeFase": cuadro["defase"].to_numpy(),
-    })
-    evento = st.dataframe(
-        tabla[COLUMNAS_EXCEL],
-        hide_index=True,
-        use_container_width=True,
-        height=640,
-        on_select="rerun",
-        selection_mode="single-row",
-        key=clave,
-        column_config={
-            "Proyecto": st.column_config.TextColumn("Proyecto", width="large"),
-            "Etapa Proyecto": st.column_config.TextColumn("Etapa Proyecto", width="medium"),
-            "Fecha de Inicio": st.column_config.DateColumn("Fecha de Inicio", format="DD/MM/YYYY"),
-            "Fecha de Fin": st.column_config.DateColumn("Fecha de Fin", format="DD/MM/YYYY"),
-            "Pry Cierre": st.column_config.DateColumn("Pry Cierre", format="DD/MM/YYYY"),
-            "Rapidez": st.column_config.NumberColumn("Rapidez", format="%.1f"),
-            "Asignadas": columna_numero("Asignadas", "Suma de horas de las tareas raíz"),
-            "Contratadas": columna_numero("Contratadas", "Horas vendidas del proyecto"),
-            "Acumulado": columna_numero("Acumulado", "Horas registradas antes del mes del reporte"),
-            "Mes": columna_numero("Mes", "Horas registradas en el mes de la fecha del reporte"),
-            "BackLog": columna_numero("BackLog", "Tareas raíz en etapa Inicio"),
-            "Planning": columna_numero("Planning", "Tareas raíz en Planeado o En ejecución, sin Hecho ni Cancelado"),
-            "Done": columna_numero("Done", "Tareas raíz en etapa Finalizado"),
-            "DeFase": columna_numero("DeFase", "Contratadas − Acumulado − Mes"),
-        },
-    )
-
-    totales = {nombre: pd.to_numeric(tabla[nombre], errors="coerce").sum() for nombre in HORAS}
-    st.caption(
-        "Totales · "
-        + " · ".join(f"{nombre}: {valor:,.2f}" for nombre, valor in totales.items())
-    )
-    st.download_button(
-        "Descargar cuadro",
-        csv_bytes(tabla),
-        file_name=archivo,
-        mime="text/csv",
-        key=f"csv_{clave}",
-    )
-
-    filas = evento.selection.rows if evento is not None and evento.selection is not None else []
-    if not filas:
-        st.info("Selecciona un proyecto en la tabla para desplegar vendedor, gerente, recursos y horas.")
-        return
-
-    elegido = cuadro.iloc[filas[0]]
+def _detalle_proyecto(proyectos, acciones, horas_reg, fecha_reporte, elegido):
     pid = int(elegido["project_id"])
     ficha_df = proyectos[proyectos["project_id"] == pid]
     ficha = ficha_df.iloc[0] if not ficha_df.empty else None
-
-    st.subheader(str(elegido["proyecto_ui"]))
     if ficha is not None:
         c1, c2, c3, c4 = st.columns(4)
         c1.markdown(f"**Etapa**  \n{ficha['etapa_proyecto']}")
@@ -226,6 +153,86 @@ def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, arc
         )
 
 
+def pintar_cuadro(proyectos, acciones, horas_reg, fecha_reporte, clave: str, archivo: str, vacio: str):
+    """Tabla del cuadro y, al seleccionar una fila, el detalle del proyecto."""
+    cuadro = cuadro_reporte(proyectos, horas_reg, fecha_reporte)
+    if cuadro.empty:
+        st.info(vacio)
+        return
+
+    base = proyectos.drop_duplicates("project_id").set_index("project_id")
+    ids = cuadro["project_id"]
+
+    def traer(columna):
+        return ids.map(base[columna]) if columna in base.columns else None
+
+    tabla = pd.DataFrame({
+        "Proyecto": cuadro["proyecto_ui"].to_numpy(),
+        "Etapa Proyecto": cuadro["etapa_proyecto"].to_numpy(),
+        "Fecha de Inicio": traer("fecha_inicio").to_numpy(),
+        "Fecha de Fin": traer("fecha_fin").to_numpy(),
+        "Etiquetas": traer("etiquetas").to_numpy(),
+        "Vendedor": traer("vendedor").to_numpy(),
+        "Gerente": traer("gerente").to_numpy(),
+        "Pry Cierre": traer("fecha_real_cierre").to_numpy(),
+        "Rapidez": traer("rapidez").to_numpy(),
+        "Asignadas": traer("horas_tareas").to_numpy(),
+        "Contratadas": cuadro["contratadas"].to_numpy(),
+        "Acumulado": cuadro["acumulado"].to_numpy(),
+        "Mes": cuadro["mes"].to_numpy(),
+        "BackLog": cuadro["backlog"].to_numpy(),
+        "Planning": cuadro["planning"].to_numpy(),
+        "Done": cuadro["done"].to_numpy(),
+        "Desface": cuadro["defase"].to_numpy(),
+    })
+    evento = st.dataframe(
+        tabla[COLUMNAS_EXCEL],
+        hide_index=True,
+        use_container_width=True,
+        height=420,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=clave,
+        column_config={
+            "Proyecto": st.column_config.TextColumn("Proyecto", width="large"),
+            "Etapa Proyecto": st.column_config.TextColumn("Etapa Proyecto", width="medium"),
+            "Fecha de Inicio": st.column_config.DateColumn("Fecha de Inicio", format="DD/MM/YYYY"),
+            "Fecha de Fin": st.column_config.DateColumn("Fecha de Fin", format="DD/MM/YYYY"),
+            "Pry Cierre": st.column_config.DateColumn("Pry Cierre", format="DD/MM/YYYY"),
+            "Rapidez": st.column_config.NumberColumn("Rapidez", format="%.1f"),
+            "Asignadas": columna_numero("Asignadas", "Suma de horas de las tareas raíz"),
+            "Contratadas": columna_numero("Contratadas", "Horas vendidas del proyecto"),
+            "Acumulado": columna_numero("Acumulado", "Horas registradas antes del mes del reporte"),
+            "Mes": columna_numero("Mes", "Horas registradas en el mes de la fecha del reporte"),
+            "BackLog": columna_numero("BackLog", "Tareas raíz en etapa Inicio"),
+            "Planning": columna_numero("Planning", "Tareas raíz en Planeado o En ejecución, sin Hecho ni Cancelado"),
+            "Done": columna_numero("Done", "Tareas raíz en etapa Finalizado"),
+            "Desface": columna_numero("Desface", "Contratadas − Acumulado − Mes"),
+        },
+    )
+
+    filas = evento.selection.rows if evento is not None and evento.selection is not None else []
+    if not filas:
+        st.caption("Marca la casilla de un proyecto para desplegar sus recursos y sus horas registradas.")
+    else:
+        elegido = cuadro.iloc[filas[0]]
+        with st.expander(f"Detalle · {elegido['proyecto_ui']}", expanded=True):
+            _detalle_proyecto(proyectos, acciones, horas_reg, fecha_reporte, elegido)
+
+    totales = {nombre: pd.to_numeric(tabla[nombre], errors="coerce").sum() for nombre in HORAS}
+    st.caption(
+        "Totales · "
+        + " · ".join(f"{nombre}: {valor:,.2f}" for nombre, valor in totales.items())
+    )
+    st.download_button(
+        "Descargar cuadro",
+        csv_bytes(tabla),
+        file_name=archivo,
+        mime="text/csv",
+        key=f"csv_{clave}",
+    )
+
+
 # ─────────────────────────────────────────────
 # Período: desde el 1 de enero del año inicial hasta el día del reporte
 # ─────────────────────────────────────────────
@@ -254,9 +261,9 @@ def pintar_mes(proyectos, acciones, por_empleado, fecha_reporte, factor: float, 
     """Horas que se debían entregar en el mes y movimiento de proyectos."""
     inicio_mes = date(fecha_reporte.year, fecha_reporte.month, 1)
     st.caption(
-        f"Del {inicio_mes:%d/%m/%Y} al {fecha_reporte:%d/%m/%Y}, proyectos y bolsas de horas. "
+        f"Del {inicio_mes:%d/%m/%Y} al {fecha_reporte:%d/%m/%Y}. "
         "Debería = (horario − festivos − ausencias) × factor. "
-        "Entregó = horas registradas en esos proyectos."
+        "Entregó = todas las horas que la persona registró en Odoo ese mes, en cualquier proyecto."
     )
 
     horas_mes = por_empleado
@@ -282,6 +289,16 @@ def pintar_mes(proyectos, acciones, por_empleado, fecha_reporte, factor: float, 
     for aviso in (plantilla or {}).get("warnings") or []:
         st.warning(aviso)
 
+    horas_entregadas = horas_mes if horas_mes is not None else pd.DataFrame()
+    if plantilla is not None and not plantilla["empleados"].empty:
+        equipo = tuple(sorted({
+            int(valor) for valor in plantilla["empleados"]["employee_id"].dropna().tolist()
+        }))
+        try:
+            horas_entregadas = load_horas_equipo(equipo, inicio_mes.isoformat(), fecha_reporte.isoformat())
+        except OdooError as exc:
+            st.warning(str(exc))
+
     st.markdown("**Horas del mes**")
     if plantilla is None:
         entrega = pd.DataFrame()
@@ -290,7 +307,7 @@ def pintar_mes(proyectos, acciones, por_empleado, fecha_reporte, factor: float, 
             plantilla["empleados"],
             plantilla["asistencia"],
             plantilla["ausencias"],
-            horas_mes if horas_mes is not None else pd.DataFrame(),
+            horas_entregadas,
             inicio_mes,
             fecha_reporte,
             plantilla["tz"],
@@ -493,7 +510,7 @@ st.caption(
     f"Desde el 1 de enero de {int(anio)} hasta el {fecha_reporte:%d/%m/%Y}, "
     "día del reporte. Acumulado es lo registrado hasta el mes anterior. "
     "Mes es el mes de la fecha del reporte, hasta ese día. "
-    "DeFase = Contratadas − Acumulado − Mes. "
+    "Desface = Contratadas − Acumulado − Mes. "
     "Las bolsas de horas están en su propia pestaña, por la etiqueta Bolsa de Horas."
 )
 

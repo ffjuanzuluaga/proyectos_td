@@ -413,21 +413,37 @@ def clasificar_movimiento(projects: pd.DataFrame, inicio: date, fin: date) -> di
 
 
 def _horas_del_dia(dia: date, calendar_id: int | None, asistencia: list[dict]) -> float:
+    """Horas del día. Si dos franjas se solapan, se cuentan una sola vez."""
     if not calendar_id:
         return 0.0
     semana = str(dia.isocalendar()[1] % 2)
     dow = str(dia.weekday())
-    total = 0.0
+    tramos = []
     for slot in asistencia:
         if int(slot.get("calendar_id") or 0) != int(calendar_id):
             continue
-        if str(slot.get("dayofweek")) != dow:
+        dia_slot = str(slot.get("dayofweek")).split(".")[0]
+        if dia_slot != dow:
             continue
         tipo = slot.get("week_type")
-        if tipo not in (None, False, "") and str(tipo) != semana:
+        if tipo not in (None, False, "") and str(tipo).split(".")[0] != semana:
             continue
-        total += max(0.0, _num(slot.get("hour_to")) - _num(slot.get("hour_from")))
-    return total
+        inicio = _num(slot.get("hour_from"))
+        fin = _num(slot.get("hour_to"))
+        if fin > inicio:
+            tramos.append((inicio, fin))
+    if not tramos:
+        return 0.0
+    tramos.sort()
+    actual_ini, actual_fin = tramos[0]
+    total = 0.0
+    for inicio, fin in tramos[1:]:
+        if inicio <= actual_fin:
+            actual_fin = max(actual_fin, fin)
+        else:
+            total += actual_fin - actual_ini
+            actual_ini, actual_fin = inicio, fin
+    return total + (actual_fin - actual_ini)
 
 
 def _a_local(value, tz: ZoneInfo):
@@ -1320,3 +1336,43 @@ def load_movimientos(inicio: str, fin: str) -> tuple[pd.DataFrame, list[str]]:
         frame = frame.copy()
         frame["fecha_real_cierre"] = frame["fecha_fin"]
     return frame, warnings
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando horas entregadas del equipo...")
+def load_horas_equipo(employee_ids: tuple[int, ...], date_from: str, date_to: str) -> pd.DataFrame:
+    """Horas de parte de horas del empleado en cualquier proyecto, no solo TD.
+
+    La columna Entregó compara contra el horario del mes. Si solo se suman los
+    proyectos de Transformación Digital, alguien que registró el resto en
+    soporte u otra línea aparece con casi cero.
+    """
+    if not employee_ids:
+        return pd.DataFrame(columns=EMPLEADO_COLS)
+    fields = _pick("account.analytic.line", ["date", "unit_amount", "employee_id", "project_id", "task_id"])
+    domain = [
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+        ("unit_amount", "!=", 0),
+        "|", ("project_id", "!=", False), ("task_id", "!=", False),
+    ]
+    try:
+        lineas = search_read_in("account.analytic.line", "employee_id", list(employee_ids), domain, fields)
+    except OdooError:
+        lineas = search_read_in(
+            "account.analytic.line", "employee_id", list(employee_ids),
+            [("date", ">=", date_from), ("date", "<=", date_to), ("unit_amount", "!=", 0)],
+            [campo for campo in fields if campo != "task_id"],
+        )
+    rows = []
+    for linea in lineas:
+        emp = _m2o_id(linea.get("employee_id"))
+        if not emp:
+            continue
+        rows.append({
+            "employee_id": emp,
+            "project_id": _m2o_id(linea.get("project_id")) or 0,
+            "responsable": _m2o_name(linea.get("employee_id"), "-"),
+            "date": linea.get("date") or None,
+            "horas": _num(linea.get("unit_amount")),
+        })
+    return build_horas_empleado(rows)
